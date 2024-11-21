@@ -1,26 +1,27 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
+	"os/user"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
+
+	"golang.org/x/mod/modfile"
 )
 
-var gopath = ""
-var maxDepth = flag.Int("maxDepth", -1, "Maximum recursion level to scan, -1 for no limit, otherwise must be an integer greater than 0, ignored if -find specified. Defaults to -1.")
-var modulePath = flag.String("modulePath", ".", "Path to module to scan, can be relative or absolute. Defaults to current working directory.")
-var versionFlag = flag.Bool("version", false, "Print out go-tree version.")
-var searchText = flag.String("find", "", "Search for a specific module. Useful for if you're looking for the dependency chain for a specific module. If not set, the program will print out the entire tree.")
-
-type dependencyChain struct {
-	module   string
-	children []dependencyChain
-}
+var (
+	gopath      = ""
+	maxDepth    = flag.Int("max-depth", -1, "Maximum recursion level to scan, -1 for no limit, otherwise must be an integer greater than 0, ignored if -find specified. Defaults to -1.")
+	modulePath  = flag.String("module-path", ".", "Path to module to scan, can be relative or absolute. Defaults to current working directory.")
+	versionFlag = flag.Bool("version", false, "Print out go-tree version.")
+)
 
 func main() {
 	flag.Parse()
@@ -34,7 +35,7 @@ func main() {
 		fmt.Println("Invalid value supplied to for maxDepth, must either be -1 or an integer grater than 0")
 	}
 
-	cwd := *modulePath
+	cwd := strings.TrimSpace(*modulePath)
 
 	if cwd == "." {
 		dir, err := os.Getwd()
@@ -43,106 +44,108 @@ func main() {
 			os.Exit(1)
 		}
 		cwd = dir
-	} else {
-		if !path.IsAbs(*modulePath) {
 
-			dir, err := os.Getwd()
-			if err != nil {
-				log.Println(err)
-				os.Exit(1)
-			}
-			cwd = path.Join(dir, *modulePath)
+	} else if !path.IsAbs(cwd) && strings.HasPrefix(cwd, "~") {
+		usr, err := user.Current()
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
 		}
+		cwd = filepath.Join(usr.HomeDir, strings.TrimPrefix(cwd, "~"))
+	} else if !path.IsAbs(cwd) {
+		dir, err := os.Getwd()
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+		cwd = filepath.Join(dir, cwd)
 	}
 
 	gopath = os.Getenv("GOPATH")
 
-	modFile := path.Join(cwd, "go.mod")
+	modFile := filepath.Join(cwd, "go.mod")
 	if _, err := os.Stat(modFile); os.IsNotExist(err) {
 		println("ERROR: go.mod is not present in this directory, please only run this tool in the root of your go project or specify a path to the root directory of a go project")
 		os.Exit(1)
 	}
 
-	if *searchText != "" {
-		chain := search(cwd)
-		if len(chain.children) != 0 {
-			printChain(chain, "")
-		} else {
-			fmt.Println("Unable to find module '" + *searchText + "' in dependency tree.")
-		}
-	} else {
-		getModuleList(getModuleName(cwd), "", *maxDepth)
+	mod := module{
+		cache:   make(map[string]struct{}),
+		writer:  new(bytes.Buffer),
+		unknown: new(bytes.Buffer),
 	}
+	mod.List(cwd, *maxDepth)
+
+	mod.Flush(os.Stdout)
 
 	os.Exit(0)
 }
 
-func printChain(chain dependencyChain, indent string) {
-	if len(chain.children) == 0 {
-		fmt.Println(indent + chain.module)
-	} else {
-		fmt.Println(indent + chain.module + ":")
-		for _, child := range chain.children {
-			printChain(child, indent+"  ")
-		}
-	}
+type module struct {
+	cache   map[string]struct{}
+	writer  *bytes.Buffer
+	unknown *bytes.Buffer
 }
 
-func search(cwd string) dependencyChain {
-	fmt.Println("Searching for " + *searchText)
-
-	return dependencyChain{
-		module:   getModuleName(cwd),
-		children: rescursiveFind(getModuleName(cwd)),
-	}
+func (m *module) List(cwd string, depth int) {
+	modName := getModuleName(cwd)
+	m.getModuleList(modName, "", depth)
 }
 
-func rescursiveFind(module string) []dependencyChain {
-	children := make([]dependencyChain, 0)
-	rawPath, modFound := constructFilePath(escapeCapitalsInModuleName(module))
+func (m *module) Flush(writer io.Writer) {
+	fmt.Fprintln(writer, "--------------------")
+	fmt.Fprintln(writer, "Direct dependencies:")
+	fmt.Fprintln(writer, "--------------------")
+	fmt.Fprintln(writer, m.writer.String())
+	fmt.Fprintln(writer, "-----------------------------------------------------")
+	fmt.Fprintln(writer, "Transient (not local / not compiled in) dependencies:")
+	fmt.Fprintln(writer, "-----------------------------------------------------")
+	fmt.Fprintln(writer, m.unknown.String())
+}
 
+func (m *module) getModuleList(modPath, indent string, depth int) {
+	if depth == 0 {
+		m.writeLine(indent, modPath)
+		return
+	}
+
+	if _, ok := m.cache[modPath]; ok {
+		return
+	}
+	m.cache[modPath] = struct{}{}
+
+	rawPath, modFound := constructFilePath(escapeCapitalsInModuleName(modPath))
 	if !modFound {
-		return children
+		m.writeUnknownLine(modPath)
+		return
 	}
 
-	modFilePath := path.Join(rawPath, "go.mod")
-	fileBytes, err := ioutil.ReadFile(modFilePath)
+	modFilePath := filepath.Join(rawPath, "go.mod")
 
+	m.writeLine(indent, modPath)
+
+	fileBytes, err := os.ReadFile(modFilePath)
 	if err != nil {
-		return children
+		return
 	}
 
-	found := false
-
-	lines := strings.Split(string(fileBytes), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !found {
-			if line == "require (" {
-				found = true
-			}
-		} else {
-			if line == "" {
-				// skip
-			} else if strings.Split(line, " ")[0] == *searchText {
-				children = append(children, dependencyChain{
-					module:   line,
-					children: make([]dependencyChain, 0),
-				})
-			} else if line == ")" {
-				return children
-			} else {
-				chain := rescursiveFind(line)
-				if len(chain) > 0 {
-					children = append(children, dependencyChain{
-						module:   line,
-						children: chain,
-					})
-				}
-			}
-		}
+	file, err := modfile.Parse(modFilePath, fileBytes, nil)
+	if err != nil {
+		return
 	}
-	return children
+
+	for _, require := range file.Require {
+		line := require.Mod.Path + " " + require.Mod.Version
+		m.getModuleList(line, indent+"  ", depth-1)
+	}
+}
+
+func (m *module) writeLine(indent, line string) {
+	fmt.Fprintln(m.writer, strings.Split(line, " //")[0])
+}
+
+func (m *module) writeUnknownLine(line string) {
+	fmt.Fprintln(m.unknown, strings.Split(line, " //")[0])
 }
 
 func getNameAndVersion(module string) (string, string) {
@@ -150,27 +153,29 @@ func getNameAndVersion(module string) (string, string) {
 		s := strings.Split(module, "@")
 		return s[0], s[1]
 	}
+
 	s := strings.Split(module, " ")
 	if len(s) == 1 {
 		return s[0], ""
 	}
+
 	return s[0], getSemVer(s[1])
 }
 
 func constructFilePath(dep string) (string, bool) {
 	module, version := getNameAndVersion(dep)
-	pkgPath := path.Join(gopath, "pkg", "mod", module+"@"+getSemVer(version))
-	fullVersionPkgPath := path.Join(gopath, "pkg", "mod", module+"@"+version)
-	srcPath := path.Join(gopath, "src", module)
 
+	srcPath := filepath.Join(gopath, "src", module)
 	if _, err := os.Stat(srcPath); err == nil || !os.IsNotExist(err) {
 		return srcPath, true
 	}
 
+	pkgPath := filepath.Join(gopath, "pkg", "mod", module+"@"+getSemVer(version))
 	if _, err := os.Stat(pkgPath); err == nil || !os.IsNotExist(err) {
 		return pkgPath, true
 	}
 
+	fullVersionPkgPath := filepath.Join(gopath, "pkg", "mod", module+"@"+version)
 	if _, err := os.Stat(fullVersionPkgPath); err == nil || !os.IsNotExist(err) {
 		return fullVersionPkgPath, true
 	}
@@ -178,48 +183,9 @@ func constructFilePath(dep string) (string, bool) {
 	return "", false
 }
 
-func getModuleList(modPath, indent string, depth int) {
-	if depth == 0 {
-		fmt.Println(indent + strings.Split(modPath, " //")[0])
-		return
-	}
-	rawPath, modFound := constructFilePath(escapeCapitalsInModuleName(modPath))
-	if !modFound {
-		fmt.Println(indent + strings.Split(modPath, " //")[0])
-		return
-	}
-	modFilePath := path.Join(rawPath, "go.mod")
-	fileBytes, err := ioutil.ReadFile(modFilePath)
-
-	if err != nil {
-		fmt.Println(indent + strings.Split(modPath, " //")[0])
-		return
-	}
-
-	found := false
-
-	lines := strings.Split(string(fileBytes), "\n")
-	fmt.Println(indent + strings.Split(modPath, " //")[0] + ":")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !found {
-			if line == "require (" {
-				found = true
-			}
-		} else {
-			if line == "" {
-				// skip
-			} else if line == ")" {
-				return
-			} else {
-				getModuleList(line, indent+"  ", depth-1)
-			}
-		}
-	}
-}
+var re = regexp.MustCompile(`v\d+\.\d+\.\d+`)
 
 func getSemVer(version string) string {
-	re := regexp.MustCompile("(v\\d+\\.\\d+\\.\\d+)(-.*)*")
 	match := re.FindStringSubmatch(version)
 	if len(match) == 0 {
 		return ""
@@ -230,9 +196,8 @@ func getSemVer(version string) string {
 }
 
 func getModuleName(cwd string) string {
-
 	modFilePath := path.Join(cwd, "go.mod")
-	fileBytes, err := ioutil.ReadFile(modFilePath)
+	fileBytes, err := os.ReadFile(modFilePath)
 
 	if err != nil {
 		fmt.Println("Error reading go.mod: ", err)
