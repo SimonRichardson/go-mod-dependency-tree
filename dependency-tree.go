@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -70,9 +71,10 @@ func main() {
 	}
 
 	mod := module{
-		cache:   make(map[string]struct{}),
-		writer:  new(bytes.Buffer),
-		unknown: new(bytes.Buffer),
+		packages: make(map[string]map[int]struct{}),
+		indexes:  make(map[string]int),
+		unknown:  make(map[string]struct{}),
+		cache:    make(map[string]struct{}),
 	}
 	mod.List(cwd, *maxDepth)
 
@@ -82,9 +84,10 @@ func main() {
 }
 
 type module struct {
-	cache   map[string]struct{}
-	writer  *bytes.Buffer
-	unknown *bytes.Buffer
+	packages map[string]map[int]struct{}
+	indexes  map[string]int
+	unknown  map[string]struct{}
+	cache    map[string]struct{}
 }
 
 func (m *module) List(cwd string, depth int) {
@@ -93,37 +96,63 @@ func (m *module) List(cwd string, depth int) {
 }
 
 func (m *module) Flush(writer io.Writer) {
-	fmt.Fprintln(writer, "--------------------")
-	fmt.Fprintln(writer, "Direct dependencies:")
-	fmt.Fprintln(writer, "--------------------")
-	fmt.Fprintln(writer, m.writer.String())
-	fmt.Fprintln(writer, "-----------------------------------------------------")
-	fmt.Fprintln(writer, "Transient (not local / not compiled in) dependencies:")
-	fmt.Fprintln(writer, "-----------------------------------------------------")
-	fmt.Fprintln(writer, m.unknown.String())
+	packages := make(map[string][]int)
+	for pkg, indexes := range m.packages {
+		if len(indexes) == 0 {
+			fmt.Fprintln(os.Stderr, "No dependencies found for package: ", pkg)
+		}
+
+		for index := range indexes {
+			packages[pkg] = append(packages[pkg], index)
+		}
+		sort.Slice(packages[pkg], func(i, j int) bool {
+			return packages[pkg][i] < packages[pkg][j]
+		})
+	}
+
+	indexes := make([]string, len(m.indexes))
+	for pkg, index := range m.indexes {
+		indexes[index] = pkg
+	}
+
+	unknown := make([]string, 0)
+	for u := range m.unknown {
+		unknown = append(unknown, u)
+	}
+
+	bytes, err := json.MarshalIndent(struct {
+		Packages map[string][]int `json:"packages"`
+		Indexes  []string         `json:"indexes"`
+		Unknown  []string         `json:"unknown"`
+	}{
+		Packages: packages,
+		Indexes:  indexes,
+		Unknown:  unknown,
+	}, "", "    ")
+	if err != nil {
+		fmt.Println("Error marshalling json: ", err)
+		os.Exit(1)
+	}
+	fmt.Fprintln(writer, string(bytes))
 }
 
 func (m *module) getModuleList(modPath, indent string, depth int) {
-	if depth == 0 {
-		m.writeLine(indent, modPath)
-		return
-	}
-
 	if _, ok := m.cache[modPath]; ok {
 		return
 	}
 	m.cache[modPath] = struct{}{}
 
+	if depth == 0 {
+		return
+	}
+
 	rawPath, modFound := constructFilePath(escapeCapitalsInModuleName(modPath))
 	if !modFound {
-		m.writeUnknownLine(modPath)
+		m.unknown[modPath] = struct{}{}
 		return
 	}
 
 	modFilePath := filepath.Join(rawPath, "go.mod")
-
-	m.writeLine(indent, modPath)
-
 	fileBytes, err := os.ReadFile(modFilePath)
 	if err != nil {
 		return
@@ -136,16 +165,20 @@ func (m *module) getModuleList(modPath, indent string, depth int) {
 
 	for _, require := range file.Require {
 		line := require.Mod.Path + " " + require.Mod.Version
+
+		index, ok := m.indexes[line]
+		if !ok {
+			index = len(m.indexes)
+			m.indexes[line] = index
+		}
+
+		if _, ok := m.packages[modPath]; !ok {
+			m.packages[modPath] = make(map[int]struct{})
+		}
+		m.packages[modPath][index] = struct{}{}
+
 		m.getModuleList(line, indent+"  ", depth-1)
 	}
-}
-
-func (m *module) writeLine(indent, line string) {
-	fmt.Fprintln(m.writer, strings.Split(line, " //")[0])
-}
-
-func (m *module) writeUnknownLine(line string) {
-	fmt.Fprintln(m.unknown, strings.Split(line, " //")[0])
 }
 
 func getNameAndVersion(module string) (string, string) {
@@ -204,27 +237,12 @@ func getModuleName(cwd string) string {
 		os.Exit(1)
 	}
 
-	lines := strings.Split(string(fileBytes), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "module ") {
-			modAddress := strings.Split(line, "module ")[1]
-			if strings.Contains(modAddress, "\"") {
-				modAddress = modAddress[1 : len(modAddress)-1]
-			}
-			var modName string
-			if strings.HasSuffix(cwd, modAddress) {
-				modName = modAddress
-			} else {
-				modName = modAddress + strings.Split(cwd, modAddress)[1]
-			}
-			return modName
-		}
+	f, err := modfile.Parse(modFilePath, fileBytes, nil)
+	if err != nil {
+		fmt.Println("Error parsing go.mod: ", err)
+		os.Exit(1)
 	}
-
-	fmt.Println("Invalid go.mod, not module name")
-	os.Exit(1)
-	return ""
+	return f.Module.Mod.Path
 }
 
 func escapeCapitalsInModuleName(name string) string {
